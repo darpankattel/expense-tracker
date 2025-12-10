@@ -2,7 +2,7 @@ import json
 import boto3
 import uuid
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any
 import logging
@@ -24,19 +24,22 @@ SIGNED_URL_EXPIRATION = int(os.environ.get('SIGNED_URL_EXPIRATION', '3600'))
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Create Expense Lambda Handler
+    Create Expense Lambda Handler. Checks for valid payload, puts item to the table, and returns response.
 
     Expected payload:
+    ```
     {
-        "amount": 25.50,
-        "merchant": "Starbucks",
-        "notes": "Coffee",
+        "merchant_name": "Starbucks",
         "category": "Food",
-        "date": "2025-01-15"
+        "amount": 25.50,
+        "receipt_date": "2025-01-15",
+        "notes": "Coffee"
     }
+    ```
     """
     try:
-        # Extract user ID from Cognito claims
+        # Extract user ID, but not username from Cognito claims
+        print("EVENT:\n", event)
         user_id = get_user_id_from_event(event) or "darpankattel"
         if not user_id:
             return create_error_response(401, "Unauthorized: Invalid token")
@@ -51,21 +54,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Generate expense ID
         expense_id = str(uuid.uuid4())
+        receipt_date = body['receipt_date']
 
         # Create expense record
         expense_data = {
             'PK': f'USER#{user_id}',
-            'SK': f'EXPENSE#{expense_id}',
-            'userId': user_id,
-            'expenseId': expense_id,
-            'amount': body['amount'],
-            'notes': body['notes'],
+            'SK': f'DATE#{receipt_date}#{expense_id}',
+            'userID': user_id,
+            'expenseID': expense_id,
+            'merchantName': body['merchant_name'],
             'category': body.get('category', 'uncategorized'),
-            'date': body['date'],
-            'ocrStatus': 'NOT_APPLICABLE',
-            'createdAt': datetime.utcnow().isoformat(),
-            'updatedAt': datetime.utcnow().isoformat()
+            'amount': body['amount'],
+            'receiptDate': receipt_date,
+            'createdAt': datetime.now().isoformat(),
         }
+        if body.get('others') is not None:
+            expense_data['others'] = body.get('others', {})
 
         # Save to DynamoDB
         table = dynamodb.Table(TABLE_NAME)
@@ -87,7 +91,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
                 'Access-Control-Allow-Methods': 'POST,OPTIONS'
             },
-            'body': json.dumps(response_data)
+            'body': response_data
         }
 
     except ClientError as e:
@@ -103,23 +107,36 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 
 def get_user_id_from_event(event: Dict[str, Any]) -> str:
-    """Extract user ID from Cognito authorizer context"""
+    """
+    Extract the immutable Cognito user ID ('sub') from API Gateway event.
+    This ID never changes for the lifetime of the user.
+    """
     try:
-        # From API Gateway Lambda authorizer
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            claims = event['requestContext']['authorizer'].get('claims', {})
-            return claims.get('sub') or claims.get('cognito:username')
+        # API Gateway REST API authorizer
+        if "requestContext" in event:
+            rc = event["requestContext"]
 
+            # Newer HTTP API (JWT authorizer)
+            if "authorizer" in rc and "jwt" in rc["authorizer"]:
+                claims = rc["authorizer"]["jwt"].get("claims", {})
+                return claims.get("sub")
+
+            # REST API (Cognito User Pool authorizer)
+            if "authorizer" in rc:
+                claims = rc["authorizer"].get("claims", {})
+                return claims.get("sub")
+
+        # If no ID available
         return None
 
     except Exception as e:
-        logger.error(f"Error extracting user ID: {str(e)}")
+        logger.error(f"Error extracting Cognito user ID: {e}")
         return None
 
 
 def validate_expense_data(data: Dict[str, Any]) -> str:
     """Validate expense data and return error message if invalid"""
-    required_fields = ['amount', 'merchant', 'date']
+    required_fields = ['amount', 'merchant_name', 'receipt_date']
 
     for field in required_fields:
         if field not in data or data[field] is None:
@@ -135,16 +152,15 @@ def validate_expense_data(data: Dict[str, Any]) -> str:
     except (ValueError, TypeError):
         return "Invalid amount format"
 
-    # Validate date format (YYYY-MM-DD)
+    # Validate receipt_date format (YYYY-MM-DD)
     try:
-        datetime.strptime(data['date'], '%Y-%m-%d')
+        datetime.strptime(data['receipt_date'], '%Y-%m-%d')
     except ValueError:
-        return "Invalid date format. Use YYYY-MM-DD"
-
-    # Validate merchant length
-    if len(data['merchant'].strip()) == 0:
+        return "Invalid receipt_date format. Use YYYY-MM-DD"
+    # Validate merchant_name length
+    if len(data['merchant_name'].strip()) == 0:
         return "Merchant cannot be empty"
-    if len(data['merchant']) > 500:
+    if len(data['merchant_name']) > 500:
         return "Merchant too long (max 500 characters)"
 
     # Validate category if provided
@@ -164,26 +180,16 @@ def create_error_response(status_code: int, message: str) -> Dict[str, Any]:
             'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
             'Access-Control-Allow-Methods': 'POST,OPTIONS'
         },
-        'body': json.dumps({
+        'body': {
             'error': message,
             'statusCode': status_code
-        })
-    }
-
-
-lambda_handler({
-    "body": json.dumps({
-        "amount": 45.67,
-        "merchant": "Amazon",
-        "notes": "Office supplies",
-        "category": "Work",
-        "date": "2025-02-20"
-    }),
-    "requestContext": {
-        "authorizer": {
-            "claims": {
-                "sub": "user-1234"
-            }
         }
     }
-}, None)
+
+
+"""
+{
+  "body": "{\"merchant_name\": \"Starbucks\", \"category\": \"Food\", \"amount\": 25.5, \"receipt_date\": \"2025-01-15\", \"notes\": \"Coffee\"}"
+}
+
+"""
